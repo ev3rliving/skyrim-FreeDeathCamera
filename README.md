@@ -15,7 +15,7 @@ Exit free camera before loading a save if you encounter a crash. The plugin does
 
 Nexus release 1.1 packages plugin build 0.1.11. The DLL and its log retain that internal version.
 
-Original [Free Death Camera](https://www.nexusmods.com/skyrim/mods/69791) by gp160 (Iron Armor). This update was developed with AI-assisted coding and documentation. Third-party dependency licenses are included.
+Original [Free Death Camera](https://www.nexusmods.com/skyrim/mods/69791) by gp160 (Iron Armor). Third-party dependency licenses are included.
 
 ## Build the source
 
