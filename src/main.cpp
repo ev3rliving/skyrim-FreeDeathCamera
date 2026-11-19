@@ -7,11 +7,16 @@
 #include "CameraMotion.h"
 #include "OrbitCamera.h"
 #include "CameraHandoff.h"
+#include "RuntimeSupport.h"
+#include "HookValidation.h"
+#include "OrbitHookPattern.h"
 
 namespace
 {
-    constexpr REL::Version kAE{1, 6, 1170, 0};
-    constexpr REL::Version kSE{1, 5, 97, 0};
+    static_assert(offsetof(RE::FreeCameraState, translation)==0x30);
+    static_assert(offsetof(RE::FreeCameraState, rotation)==0x3C);
+    static_assert(offsetof(RE::BleedoutCameraState, rotationMtx)==0xE8);
+    static_assert(offsetof(RE::BleedoutCameraState, zoom)==0x10C);
     // The renderer adds this offset to the base FOV, including during bow zoom.
     // IDs cross-checked with SmoothCam's offset_ids.h and both Address Library tables.
     constexpr REL::RelocationID kWorldFOVOffset{527997, 414942};
@@ -69,21 +74,19 @@ namespace
 
     bool InstallOrbitObstructionHook(std::uintptr_t update)
     {
-        // Verified in running 1.6.1170: retry++, position/camera, call, test AL.
-        // Resolve via vtable and validated instruction bytes, never fixed RVAs.
-        constexpr std::uint8_t prefix[]{0xFF,0xC6,0x41,0xB0,0x01,0x48,0x8D,0x53,0x40,0x48,0x8B,0x4B,0x10};
-        constexpr std::uint8_t suffix[]{0x84,0xC0,0x0F,0x85};
-        std::uintptr_t site{};
-        const auto bytes = reinterpret_cast<const std::uint8_t*>(update);
-        for (std::size_t i = 0; i + 26 <= 0x800; ++i) {
-            if (std::memcmp(bytes + i, prefix, sizeof(prefix)) == 0 &&
-                bytes[i + sizeof(prefix)] == 0xE8 &&
-                std::memcmp(bytes + i + sizeof(prefix) + 5, suffix, sizeof(suffix)) == 0) {
-                if (site) return false;
-                site = update + i + sizeof(prefix);
-            }
-        }
-        if (!site) return false;
+        // Preserve the 1.1 signature, but never scan an arbitrary predecessor
+        // trampoline or an unreadable range. This patch is optional on every runtime.
+        const auto text=REL::Module::get().segment(REL::Segment::textx);
+        if(update<text.address() || update>=text.address()+text.size()) return false;
+        const auto length=std::min<std::size_t>(0x800,text.address()+text.size()-update);
+        if(!Camera::Validation::Accessible(update,length)) return false;
+        const auto match=Camera::Pattern::FindCall({reinterpret_cast<const std::uint8_t*>(update),length});
+        if(!match) return false;
+        const auto site=update+*match;
+        std::int32_t displacement{};
+        std::memcpy(&displacement,reinterpret_cast<const void*>(site+1),sizeof(displacement));
+        const auto target=static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site+5)+displacement);
+        if(!Camera::Validation::Accessible(target,1,true)) return false;
         SKSE::AllocTrampoline(64);
         originalOrbitObstruction = SKSE::GetTrampoline().write_call<5>(site, OrbitObstructionCheck);
         spdlog::info("Installed conditional orbit obstruction retry hook.");
@@ -185,7 +188,7 @@ namespace
         for (auto event = *events; event; event = event->next) {
             const auto button = event->AsButtonEvent();
             if (button && button->GetDevice() == RE::INPUT_DEVICE::kKeyboard &&
-                button->idCode == settings.tfcHotkey && button->IsDown()) {
+                button->GetIDCode() == settings.tfcHotkey && button->IsDown()) {
                 // Defer the state change until input dispatch has finished.
                 if (const auto tasks = SKSE::GetTaskInterface())
                     tasks->AddTask([] { if (installed && InputAllowed()) ToggleCameraHotkey(); });
@@ -216,7 +219,7 @@ namespace
         {
             if (deathOrbitStarted && !PlayerDead()) deathOrbitStarted = false;
             QueueCameraHotkey(events);
-            if (!events || !InDeathCamera() || !InputAllowed()) {
+            if (!installed || !events || !InDeathCamera() || !InputAllowed()) {
                 mouse.Clear();
                 return RE::BSEventNotifyControl::kContinue;
             }
@@ -228,8 +231,8 @@ namespace
                 } else if (const auto button = event->AsButtonEvent(); button &&
                     button->GetDevice() == RE::INPUT_DEVICE::kMouse && button->IsPressed()) {
                     // DirectInput mouse button IDs 8/9 are wheel up/down.
-                    if (button->idCode == 8) mouse.wheel += button->Value();
-                    if (button->idCode == 9) mouse.wheel -= button->Value();
+                    if (button->GetIDCode() == 8) mouse.wheel += button->Value();
+                    if (button->GetIDCode() == 9) mouse.wheel -= button->Value();
                 }
             }
             return RE::BSEventNotifyControl::kContinue;
@@ -298,10 +301,10 @@ namespace
         scaledFreeState = nullptr;
         const auto camera = RE::PlayerCamera::GetSingleton();
         if (camera && deathOverride && dead) {
-            next = camera->cameraStates[RE::CameraState::kFree];
+            next = camera->GetRuntimeData().cameraStates[RE::CameraState::kFree];
         } else if (camera && restoreAfterResurrection) {
             Reset();
-            next = camera->cameraStates[RE::CameraState::kThirdPerson];
+            next = camera->GetRuntimeData().cameraStates[RE::CameraState::kThirdPerson];
         }
     }
 
@@ -387,7 +390,7 @@ namespace
         if (orbit && dead) ClearDeathFOVOffset();
         if (deathOverride && PlayerDead()) {
             const auto camera = RE::PlayerCamera::GetSingleton();
-            if (camera) next = camera->cameraStates[RE::CameraState::kFree];
+            if (camera) next = camera->GetRuntimeData().cameraStates[RE::CameraState::kFree];
         }
     }
 
@@ -411,8 +414,8 @@ namespace
         }
         const auto camera = RE::PlayerCamera::GetSingleton();
         if (!camera || !camera->currentState) return false;
-        const auto freeState = static_cast<RE::FreeCameraState*>(camera->cameraStates[RE::CameraState::kFree].get());
-        const auto bleedout = camera->cameraStates[RE::CameraState::kBleedout].get();
+        const auto freeState = static_cast<RE::FreeCameraState*>(camera->GetRuntimeData().cameraStates[RE::CameraState::kFree].get());
+        const auto bleedout = camera->GetRuntimeData().cameraStates[RE::CameraState::kBleedout].get();
         if (!freeState || !bleedout) return false;
         if (camera->IsInFreeCameraMode()) {
             Reset();
@@ -471,9 +474,35 @@ namespace
         }
         REL::Relocation<std::uintptr_t> freeVtable{RE::VTABLE_FreeCameraState[0]};
         REL::Relocation<std::uintptr_t> bleedVtable{RE::VTABLE_BleedoutCameraState[0]};
+        const auto validate=[](std::uintptr_t table,std::size_t slot,const char* name) {
+            if(!Camera::Validation::HookTarget(table,slot)) {
+                spdlog::error("Invalid {} hook target (slot {}); no camera hooks installed",name,slot);
+                return false;
+            }
+            spdlog::info("Validated {} hook slot {}",name,slot);
+            return true;
+        };
+        if(!validate(freeVtable.address(),3,"Free Update") ||
+            !validate(freeVtable.address(),5,"Free Translation") ||
+            !validate(bleedVtable.address(),1,"Bleedout Begin") ||
+            !validate(bleedVtable.address(),2,"Bleedout End") ||
+            !validate(bleedVtable.address(),3,"Bleedout Update")) return;
+        if(!Camera::Validation::Accessible(reinterpret_cast<std::uintptr_t>(command->executeFunction),1,true)) {
+            spdlog::error("ToggleFlyCam handler is not executable; no camera hooks installed");
+            return;
+        }
+        // These are class-level vtable hooks, just as in working release 1.1.
+        // Live camera objects are not a prerequisite at DataLoaded. The 1.2.0
+        // instance gate could abort here permanently before any controls installed.
+        const REL::Relocation<std::uintptr_t> fov{kWorldFOVOffset};
+        if(!Camera::Validation::Writable(fov.address(),sizeof(float))) {
+            spdlog::error("World FOV offset is not writable; no camera hooks installed");
+            return;
+        }
+        spdlog::info("Class-level camera hooks, ToggleFlyCam handler and FOV storage validated");
         const auto bleedUpdate = *reinterpret_cast<const std::uintptr_t*>(bleedVtable.address() + 3 * sizeof(std::uintptr_t));
         if (!InstallOrbitObstructionHook(bleedUpdate))
-            spdlog::warn("Orbit obstruction signature missing/ambiguous; engine orbit reset check remains active.");
+            spdlog::warn("Orbit obstruction signature unavailable, ambiguous or unsafe on runtime {}; engine orbit reset check remains active.", REL::Module::get().version().string());
         originalFreeUpdate = freeVtable.write_vfunc(3, FreeUpdate);
         originalFreeTranslation = freeVtable.write_vfunc(5, FreeTranslation);
         originalBleedoutBegin = bleedVtable.write_vfunc(1, BleedoutBegin);
@@ -486,6 +515,31 @@ namespace
         spdlog::info("Death camera and tfc hooks installed; command {} ({})", command->functionName, command->shortName);
     }
 
+    void LogCameraReadiness()
+    {
+        const auto camera=RE::PlayerCamera::GetSingleton();
+        if(!camera) {
+            spdlog::info("Camera singleton not ready after load; class-level hooks remain installed={}",installed);
+            return;
+        }
+        const auto check=[&](RE::CameraState index, const char* name, std::uintptr_t expected) {
+            const auto state=camera->GetRuntimeData().cameraStates[index].get();
+            if(!state) {
+                spdlog::info("{} camera instance not ready; class-level hooks remain installed={}",name,installed);
+                return;
+            }
+            if(!Camera::Validation::Accessible(reinterpret_cast<std::uintptr_t>(state),sizeof(std::uintptr_t))) {
+                spdlog::warn("{} camera instance unreadable after load",name);
+                return;
+            }
+            const auto actual=*reinterpret_cast<const std::uintptr_t*>(state);
+            if(actual==expected) spdlog::info("{} camera instance ready after load",name);
+            else spdlog::warn("{} camera vtable differs after load: actual={:#x}, expected={:#x}",name,actual,expected);
+        };
+        check(RE::CameraState::kFree,"Free",REL::Relocation<std::uintptr_t>{RE::VTABLE_FreeCameraState[0]}.address());
+        check(RE::CameraState::kBleedout,"Bleedout",REL::Relocation<std::uintptr_t>{RE::VTABLE_BleedoutCameraState[0]}.address());
+    }
+
     void OnMessage(SKSE::MessagingInterface::Message* message)
     {
         switch (message->type) {
@@ -495,7 +549,13 @@ namespace
         case SKSE::MessagingInterface::kDataLoaded: ApplyDeathReloadDelay(); Install(); break;
         case SKSE::MessagingInterface::kPreLoadGame: deathOrbitStarted = false; Reset(); break;
         case SKSE::MessagingInterface::kPostLoadGame:
-        case SKSE::MessagingInterface::kNewGame: deathOrbitStarted = false; Reset(); ApplyDeathReloadDelay(); break;
+        case SKSE::MessagingInterface::kNewGame:
+            deathOrbitStarted = false;
+            Reset();
+            ApplyDeathReloadDelay();
+            Install(); // Retry if class-level prerequisites were unavailable earlier.
+            LogCameraReadiness();
+            break;
         default: break;
         }
     }
@@ -503,26 +563,27 @@ namespace
 
 extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version = [] {
     SKSE::PluginVersionData info;
-    info.PluginVersion({0, 1, 11, 0});
+    info.PluginVersion({1, 2, 1, 0});
     info.PluginName("PostmortemTFC");
     info.AuthorName("SE/AE adaptation; original Free Death Camera by gp160 / Iron Armor");
     info.UsesAddressLibrary();
-    info.UsesStructsPost629();
-    info.CompatibleVersions({kSE, kAE});
+    info.UsesNoStructs();
+    info.CompatibleVersions({{1,5,97,0},{1,6,1170,0},{1,6,1179,0},{1,7,99,0},{1,7,104,0}});
     return info;
 }();
 
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* query, SKSE::PluginInfo* info)
 {
+    if(!query || !info) return false;
     info->infoVersion = SKSE::PluginInfo::kVersion;
     info->name = "PostmortemTFC";
-    info->version = 12;
-    return !query->IsEditor() && (query->RuntimeVersion() == kSE || query->RuntimeVersion() == kAE);
+    info->version = REL::Version{1,2,1,0}.pack();
+    return !query->IsEditor() && Camera::Runtime::Supported(query->RuntimeVersion().pack());
 }
 
 extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface* skse)
 {
-    if (skse->IsEditor() || (skse->RuntimeVersion() != kSE && skse->RuntimeVersion() != kAE)) return false;
+    if (!skse || skse->IsEditor() || !Camera::Runtime::Supported(skse->RuntimeVersion().pack())) return false;
     try {
         if (auto directory = SKSE::log::log_directory()) {
             auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>((*directory / "PostmortemTFC.log").string(), true);
@@ -530,8 +591,9 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
             spdlog::flush_on(spdlog::level::info);
         }
         SKSE::Init(skse);
+        spdlog::info("Runtime family {}; Address Library v5 capable", REL::Module::IsAE()?"AE":"SE");
         ReadSettings();
-        spdlog::info("PostmortemTFC 0.1.11 experimental port loaded; runtime {}", skse->RuntimeVersion().string());
+        spdlog::info("Free Death Camera 1.2.1 universal loaded; runtime {}", skse->RuntimeVersion().string());
         const auto messaging = SKSE::GetMessagingInterface();
         return messaging && messaging->RegisterListener(OnMessage);
     } catch (const std::exception& error) {

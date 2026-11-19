@@ -1,31 +1,28 @@
 param(
     [string]$CMake = 'cmake',
-    [string]$Generator = 'Visual Studio 17 2022'
+    [string]$Generator = 'Ninja',
+    [string]$BuildDirectory = 'build-universal',
+    [string]$PortableToolsRoot = ''
 )
 $ErrorActionPreference = 'Stop'
-$taskBuild = Join-Path $PSScriptRoot 'build'
-$taskStage = Join-Path $PSScriptRoot 'package'
-$taskArguments = @('-S', $PSScriptRoot, '-B', $taskBuild, '-G', $Generator)
+if ($PortableToolsRoot) {
+    $taskVC = Join-Path $PortableToolsRoot 'msvc/VC/Tools/MSVC/14.44.35207'
+    $taskSDK = Join-Path $PortableToolsRoot 'sdk-extracted/Windows Kits/10'
+    $taskCMakeBin = Join-Path $PortableToolsRoot 'tools/cmake-3.31.8-windows-x86_64/bin'
+    $taskNinja = Join-Path $PortableToolsRoot 'tools/ninja'
+    $env:PATH = "$taskVC/bin/Hostx64/x64;$taskSDK/bin/10.0.26100.0/x64;$taskCMakeBin;$taskNinja;$env:PATH"
+    $env:INCLUDE = "$taskVC/include;$taskSDK/Include/10.0.26100.0/ucrt;$taskSDK/Include/10.0.26100.0/shared;$taskSDK/Include/10.0.26100.0/um;$taskSDK/Include/10.0.26100.0/winrt"
+    $env:LIB = "$taskVC/lib/x64;$taskSDK/Lib/10.0.26100.0/ucrt/x64;$taskSDK/Lib/10.0.26100.0/um/x64"
+}
+$taskArguments = @('-S', $PSScriptRoot, '-B', "$PSScriptRoot/$BuildDirectory", '-G', $Generator)
 if ($Generator -like 'Visual Studio*') { $taskArguments += @('-A', 'x64') }
 else { $taskArguments += '-DCMAKE_BUILD_TYPE=Release' }
 & $CMake @taskArguments
-if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
-& $CMake --build $taskBuild --config Release --parallel 2
-if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
-$taskCMakeCommand = (Get-Command $CMake -ErrorAction Stop).Source
-$taskCTest = Join-Path (Split-Path $taskCMakeCommand -Parent) 'ctest.exe'
-& $taskCTest --test-dir $taskBuild -C Release --output-on-failure
-if ($LASTEXITCODE -ne 0) { throw 'Camera motion tests failed.' }
-& $CMake --install $taskBuild --config Release --prefix $taskStage
-if ($LASTEXITCODE -ne 0) { throw 'Packaging failed.' }
-$taskPluginOutput = Join-Path $PSScriptRoot 'Data/SKSE/Plugins'
-New-Item -ItemType Directory -Path $taskPluginOutput -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $taskStage 'SKSE/Plugins/PostmortemTFC.dll') -Destination $taskPluginOutput -Force
-# Keep a user's edited INI on subsequent builds.
-$taskIniOutput = Join-Path $taskPluginOutput 'PostmortemTFC.ini'
-if (-not (Test-Path -LiteralPath $taskIniOutput)) {
-    Copy-Item -LiteralPath (Join-Path $taskStage 'SKSE/Plugins/PostmortemTFC.ini') -Destination $taskPluginOutput
-}
-Write-Host "Staged mod files: $taskStage"
-Write-Host "Updated project DLL: $taskPluginOutput"
-
+if ($LASTEXITCODE -ne 0) { throw 'Configuration failed.' }
+& $CMake --build "$PSScriptRoot/$BuildDirectory" --config Release --parallel 2
+if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+& (Join-Path (Split-Path (Get-Command $CMake).Source) 'ctest.exe') --test-dir "$PSScriptRoot/$BuildDirectory" -C Release --output-on-failure
+if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+& $CMake --install "$PSScriptRoot/$BuildDirectory" --config Release --component Camera --prefix "$PSScriptRoot/dist/universal"
+if ($LASTEXITCODE -ne 0) { throw 'Staging failed.' }
+Compress-Archive -Path "$PSScriptRoot/dist/universal/*" -DestinationPath "$PSScriptRoot/Free-Death-Camera-1.2.1.zip" -Force

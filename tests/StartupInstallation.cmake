@@ -1,0 +1,16 @@
+# Regression for the observed 1.2.0 DataLoaded failure. Class-level hook
+# installation must not depend on live camera objects being available.
+file(READ "${SOURCE_DIR}/main.cpp" source)
+string(FIND "${source}" "    void Install()" begin)
+string(FIND "${source}" "    void LogCameraReadiness()" end)
+if(begin LESS 0 OR end LESS begin)
+    message(FATAL_ERROR "Cannot locate hook installation boundary")
+endif()
+math(EXPR length "${end}-${begin}")
+string(SUBSTRING "${source}" ${begin} ${length} install)
+if(install MATCHES "GetSingleton|cameraStates")
+    message(FATAL_ERROR "Class hook installation must not gate on live instances")
+endif()
+if(NOT install MATCHES "Validation::HookTarget" OR NOT install MATCHES "Validation::Writable")
+    message(FATAL_ERROR "Class-level hook and FOV validation must be retained")
+endif()
